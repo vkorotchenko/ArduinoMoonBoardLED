@@ -26,6 +26,11 @@ bool useadditionalled = false; // Variable to store the additional LED setting
 void setup() {
   Serial.begin(9600);
 
+  NRF_WDT->CONFIG         = 0x01;     // Configure WDT to run when CPU is asleep
+  NRF_WDT->CRV            = 3932159;  // Timeout set to 120 seconds, timeout[s] = (CRV-1)/32768
+  NRF_WDT->RREN           = 0x01;     // Enable the RR[0] reload register
+  NRF_WDT->TASKS_START    = 1;        // Start WDT
+
   if (!bleSerial.beginAndSetupBLE("Moonboard")) { // Initialize BLE UART and check if it is successful
     // This should never happen as it means that the BLE setup failed and the program cannot run!
     while (true) {
@@ -89,6 +94,8 @@ void setup() {
 }
 
 void loop() {
+  NRF_WDT->RR[0] = WDT_RR_RR_Reload;
+
   // Read messages from the BLE UART
   bleSerial.poll();
   
