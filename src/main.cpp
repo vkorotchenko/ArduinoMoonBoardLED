@@ -20,8 +20,8 @@ RgbColor violet(brightness/2, 0, brightness);
 RgbColor black(0);
 
 int state = 0; // Variable to store the current state of the problem string parser
-char problemstring[500]; // Variable to store the current problem string
-char problemstringstore[500]; // Variable to store the current problem string
+char problemstring[500]=""; // Variable to store the current problem string
+char problemstringstore[500]=""; // Variable to store the current problem string
 bool useadditionalled = false; // Variable to store the additional LED setting
 
 void setup() {
