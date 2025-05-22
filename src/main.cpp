@@ -12,6 +12,7 @@ BLEService uartService = BLEService("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
 BLECharacteristic receiveCharacteristic = BLECharacteristic("6E400002-B5A3-F393-E0A9-E50E24DCCA9E", BLEWriteWithoutResponse, 20);
 BLECharacteristic transmitCharacteristic = BLECharacteristic("6E400003-B5A3-F393-E0A9-E50E24DCCA9E", BLENotify, 20);
 
+int MAX_CHARACTERISTIC_SIZE = 512;
 
 RgbColor red(brightness, 0, 0);
 RgbColor green(0, brightness, 0);
@@ -203,7 +204,7 @@ void display(byte incoming[], int length){
 
 void characteristicWritten(BLEDevice central, BLECharacteristic characteristic) {
   int length = characteristic.valueLength();
-  byte incoming[length];
+  byte incoming[MAX_CHARACTERISTIC_SIZE];
 
   characteristic.readValue(incoming, length);
 
@@ -215,6 +216,8 @@ void characteristicWritten(BLEDevice central, BLECharacteristic characteristic) 
 
   display(incoming, length);
 
+  // clear the incoming array
+  incoming[0] = '\0';
 }
 
 void setup() {
