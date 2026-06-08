@@ -19,6 +19,50 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
+#include <esp_system.h>
+#include <esp_task_wdt.h>
+
+// Seconds the main loop may stall before the task watchdog resets the board.
+// A reset caused this way is logged as ESP_RST_TASK_WDT on the next boot, turning
+// a silent freeze into a recorded reboot with a backtrace.
+#define LOOP_WDT_TIMEOUT_S 15
+
+// --- Crash breadcrumbs -------------------------------------------------------
+// RTC_NOINIT memory keeps its value across resets (panic, watchdog, soft reset) as long
+// as power is maintained — it is NOT cleared on reboot like normal RAM. We use it to carry
+// "what was the board doing right before it died" across the crash so it can be logged on
+// the next boot. (It is lost on a full power cycle / brownout, which is expected.)
+RTC_NOINIT_ATTR static uint32_t crashMagic;
+RTC_NOINIT_ATTR static int      lastState;
+RTC_NOINIT_ATTR static char     lastProblem[256];
+#define CRASH_MAGIC 0xC0FFEE42
+
+static const char *resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_EXT:       return "external pin";
+    case ESP_RST_SW:        return "software restart";
+    case ESP_RST_PANIC:     return "PANIC / exception";
+    case ESP_RST_INT_WDT:   return "interrupt watchdog";
+    case ESP_RST_TASK_WDT:  return "task watchdog (hang)";
+    case ESP_RST_WDT:       return "other watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT (power sag)";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "unknown";
+  }
+}
+
+// Record what the board is about to do, so a crash here leaves a trail.
+static void breadcrumb(int stateNow, const char *problem) {
+  lastState = stateNow;
+  if (problem != nullptr) {
+    strncpy(lastProblem, problem, sizeof(lastProblem) - 1);
+    lastProblem[sizeof(lastProblem) - 1] = '\0';
+  }
+  crashMagic = CRASH_MAGIC;
+}
+
 // Nordic UART Service — must match what the MoonBoard app scans for (same UUIDs the
 // HardwareBLESerial library advertised on the Nano build).
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -109,6 +153,29 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 
 void setup() {
   Serial.begin(115200);
+  delay(200); // give the USB-serial link a moment so the boot report is not missed
+
+  // --- Why did we (re)boot? -------------------------------------------------
+  esp_reset_reason_t reason = esp_reset_reason();
+  Serial.println("\n==================== BOOT ====================");
+  Serial.printf("Reset reason: %s\n", resetReasonName(reason));
+
+  bool crashed = (reason == ESP_RST_PANIC || reason == ESP_RST_TASK_WDT ||
+                  reason == ESP_RST_INT_WDT || reason == ESP_RST_WDT ||
+                  reason == ESP_RST_BROWNOUT);
+  if (crashed && crashMagic == CRASH_MAGIC) {
+    Serial.println("!! Recovered from a crash. Last activity before it died:");
+    Serial.printf("   parser state = %d\n", lastState);
+    Serial.printf("   problem string = \"%s\"\n", lastProblem);
+  } else if (reason == ESP_RST_POWERON) {
+    Serial.println("(clean power-on — no prior crash context)");
+  }
+  crashMagic = 0; // clear until the next breadcrumb, so stale data is not re-reported
+  Serial.println("=============================================");
+
+  // Task watchdog: if loop() stalls for LOOP_WDT_TIMEOUT_S, force a (logged) reset.
+  esp_task_wdt_init(LOOP_WDT_TIMEOUT_S, true);
+  esp_task_wdt_add(NULL); // watch the Arduino loop task
 
   strip.Begin(); // Initialize LED strip
   strip.Show();  // Good practice to call Show() in order to clear all LEDs
@@ -145,6 +212,8 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset(); // tell the watchdog the loop is still alive
+
   // Check if message parts are available from the BLE UART
   while (rxAvailable() > 0) {
     char c = (char)rxRead();
@@ -200,6 +269,7 @@ void loop() {
 
   // State 4: complete problem string received, start parsing
   if (state == 4) {
+    breadcrumb(state, problemstring); // record context in case parsing crashes
     strip.ClearTo(black); // Turn off all LEDs in LED string
     Serial.println("\n---------");
     Serial.print("Problem string: ");
@@ -218,6 +288,9 @@ void loop() {
 
         char holdtype = hold[0]; // Hold descriptions consist of a hold type (S, P, E) ...
         int holdnumber = atoi(&hold[1]); // ... and a hold number
+        if (holdnumber < 0 || holdnumber >= (int)PixelCount) { // guard against bad input
+          Serial.printf("  ! ignoring out-of-range hold %c%d\n", holdtype, holdnumber);
+        } else {
         int lednumber = ledmapping[holdnumber];
         int additionallednumber = lednumber + additionalledmapping[holdnumber];
         if (additionalledmapping[holdnumber] != 0) {
@@ -236,6 +309,7 @@ void loop() {
           }
           // Finish holds don't get an additional LED!
         }
+        } // end bounds-valid
 
         hold = strtok(NULL, " - ");// get next hold
       }
@@ -251,6 +325,9 @@ void loop() {
 
       char holdtype = hold[0]; // Hold descriptions consist of a hold type (S, P, E) ...
       int holdnumber = atoi(&hold[1]); // ... and a hold number
+      if (holdnumber < 0 || holdnumber >= (int)PixelCount) { // guard against bad input
+        Serial.printf("  ! ignoring out-of-range hold %c%d\n", holdtype, holdnumber);
+      } else {
       int lednumber = ledmapping[holdnumber];
       Serial.print(holdtype);
       Serial.print(holdnumber);
@@ -280,6 +357,7 @@ void loop() {
         strip.SetPixelColor(lednumber, red);
         Serial.println(" (red)");
       }
+      } // end bounds-valid
 
       hold = strtok(NULL, " - "); // get next hold
 
