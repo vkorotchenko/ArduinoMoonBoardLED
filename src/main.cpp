@@ -1,6 +1,34 @@
 #include <ArduinoBLE.h>
 #include <NeoPixelBus.h>
 #include <config.h>
+#include <malloc.h>
+
+// --- Memory / timeout instrumentation ---------------------------------------
+// The SAMD21 has only 32 KB of SRAM and no heap compaction, so the heavy use of
+// the Arduino String class on the receive path can fragment the heap over time.
+// These helpers let you watch the trend: if freeRAM falls (or free chunks climb)
+// across commands and a timeout follows, fragmentation is the cause.
+extern "C" char *sbrk(int incr);
+
+// Bytes between the top of the heap and the current stack pointer (overall headroom).
+static int freeRam() {
+  char stackTop;
+  return &stackTop - reinterpret_cast<char *>(sbrk(0));
+}
+
+static void logMemory(const char *tag) {
+  struct mallinfo mi = mallinfo();
+  Serial.print("[mem] ");
+  Serial.print(tag);
+  Serial.print(" freeRAM=");
+  Serial.print(freeRam());
+  Serial.print(" heapUsed=");
+  Serial.print(mi.uordblks);
+  Serial.print(" heapFree=");
+  Serial.print(mi.fordblks);
+  Serial.print(" freeChunks=");   // rising = fragmenting
+  Serial.println(mi.ordblks);
+}
 
 #ifdef GRB
 NeoPixelBus<NeoGrbFeature, Neo800KbpsMethod> strip(PixelCount, PixelPin);
@@ -23,7 +51,8 @@ RgbColor violet(brightness/2, 0, brightness);
 RgbColor black(0);
 
 int state = 0; // Variable to store the current state of the problem string parser
-String problemstring = ""; // Variable to store the current problem string
+char problemstring[500] = "";      // current problem string (fixed buffer — no heap allocation)
+char problemstringstore[500] = ""; // copy used for the additional-LED render pass (strtok is destructive)
 bool useadditionalled = false; // Variable to store the additional LED setting
 
 
@@ -78,15 +107,22 @@ void display(byte incoming[], int length){
     }
 
     // State 3: store hold descriptions in problem string
-    if (state == 3) { 
+    if (state == 3) {
       if (c == '#') { // problem string ends with #
         state = 4; // Switch to state 4 (start parsing and show LEDs)
         continue;
       }
-      problemstring.concat(c); // add current character to problem string
+      // Append the character to the fixed buffer (bounded + null-terminated).
+      size_t len = strlen(problemstring);
+      if (len < sizeof(problemstring) - 1) {
+        problemstring[len] = c;
+        problemstring[len + 1] = '\0';
+      } else {
+        Serial.println("[warn] problemstring full, dropping char (missing '#' terminator?)");
+      }
     }
   }
-  
+
 
   // State 4: complete problem string received, start parsing
   if (state == 4) {
@@ -96,23 +132,22 @@ void display(byte incoming[], int length){
     Serial.println(problemstring);
     Serial.println("");
 
-    String problemstringstore = problemstring; // store copy of problem string
+    strcpy(problemstringstore, problemstring); // store copy (strtok below is destructive)
 
     if (useadditionalled) { // only render additional LEDs in first loop
       Serial.println("Additional LEDs:");
-      while(true){
-        int pos = problemstring.indexOf(','); // Hold descriptions are separated by a comma (,)
-        
-        String hold;
-        if (pos > 0) { // Still holds left in the problem string
-          hold = problemstring.substring(0, pos); // Extract one hold description
-        }
-        else { // Last hold in the problem string
-          hold = problemstring; 
-        }
 
-        char holdtype = hold.charAt(0); // Hold descriptions consist of a hold type (S, P, E) ...
-        int holdnumber = hold.substring(1).toInt(); // ... and a hold number
+      // Holds are separated by commas/spaces, e.g. "S5, R10, E18".
+      char *hold = strtok(problemstring, ", ");
+      while (hold != NULL) {
+
+        char holdtype = hold[0]; // Hold descriptions consist of a hold type (S, P, E) ...
+        int holdnumber = atoi(&hold[1]); // ... and a hold number
+        if (holdnumber < 0 || holdnumber >= (int)PixelCount) { // guard against bad input
+          Serial.print("[warn] ignoring out-of-range hold ");
+          Serial.print(holdtype);
+          Serial.println(holdnumber);
+        } else {
         int lednumber = ledmapping[holdnumber];
         int additionallednumber = lednumber + additionalledmapping[holdnumber];
         if (additionalledmapping[holdnumber] != 0) {
@@ -130,33 +165,26 @@ void display(byte incoming[], int length){
             Serial.println(" (yellow)");
           }
           // Finish holds don't get an additional LED!
-        }        
-
-        if (pos == -1) { // Last hold has been processed!
-          Serial.println("");
-          break;
         }
+        } // end bounds-valid
 
-        problemstring = problemstring.substring(pos+1, problemstring.length()); // Remove processed hold from string
+        hold = strtok(NULL, ", "); // get next hold
       }
 
-      problemstring = problemstringstore; // Restore problem string for rendering normal hold LEDs
+      strcpy(problemstring, problemstringstore); // Restore problem string for rendering normal hold LEDs
     }
 
     Serial.println("Problem LEDs:");
-    while(true){ // render all normal LEDs (possibly overriding additional LEDs)
-      int pos = problemstring.indexOf(','); // Hold descriptions are separated by a comma (,)
-      
-      String hold;
-      if (pos > 0) { // Still holds left in the problem string
-        hold = problemstring.substring(0, pos); // Extract one hold description
-      }
-      else { // Last hold in the problem string
-        hold = problemstring; 
-      }
+    char *hold = strtok(problemstring, ", ");
+    while (hold != NULL) {
 
-      char holdtype = hold.charAt(0); // Hold descriptions consist of a hold type (S, P, E) ...
-      int holdnumber = hold.substring(1).toInt(); // ... and a hold number
+      char holdtype = hold[0]; // Hold descriptions consist of a hold type (S, P, E) ...
+      int holdnumber = atoi(&hold[1]); // ... and a hold number
+      if (holdnumber < 0 || holdnumber >= (int)PixelCount) { // guard against bad input
+        Serial.print("[warn] ignoring out-of-range hold ");
+        Serial.print(holdtype);
+        Serial.println(holdnumber);
+      } else {
       int lednumber = ledmapping[holdnumber];
       Serial.print(holdtype);
       Serial.print(holdnumber);
@@ -186,17 +214,19 @@ void display(byte incoming[], int length){
         strip.SetPixelColor(lednumber, red);
         Serial.println(" (red)");
       }
-      
-      if (pos == -1) { // Last hold has been processed!
+      } // end bounds-valid
+
+      hold = strtok(NULL, ", "); // get next hold
+
+      if (hold == NULL) { // Last hold has been processed!
         strip.Show(); // Light up all hold (and additional) LEDs
-        problemstring = ""; // Reset problem string
+        problemstring[0] = '\0'; // Reset problem string
         useadditionalled = false; // Reset additional LED option
         state = 0; // Switch to state 0 (wait for new problem string or configuration)
         Serial.println("---------\n");
+        logMemory("after-parse"); // freeRAM should now stay flat across problems
         break;
       }
-
-      problemstring = problemstring.substring(pos+1, problemstring.length()); // Remove processed hold from string
     }
   }
 }
@@ -207,14 +237,26 @@ void characteristicWritten(BLEDevice central, BLECharacteristic characteristic) 
 
   characteristic.readValue(incoming, length);
 
+  // Echo the chunk as readable text plus its length, so dropped/garbled BLE
+  // packets are visible in the log.
+  Serial.print("[rx] len=");
+  Serial.print(length);
+  Serial.print(" data=\"");
   for (int i = 0; i < length; i++) {
-    Serial.print(incoming[i]);
-    Serial.print("-");
+    Serial.print((char)incoming[i]);
   }
-  Serial.println();
+  Serial.println("\"");
 
+  unsigned long t0 = millis();
   display(incoming, length);
+  unsigned long elapsed = millis() - t0;
 
+  // A long parse blocks BLE servicing and can trip the supervision timeout.
+  if (elapsed > 50) {
+    Serial.print("[warn] display() took ");
+    Serial.print(elapsed);
+    Serial.println(" ms (BLE not serviced during this time)");
+  }
 }
 
 void setup() {
@@ -300,8 +342,20 @@ void loop() {
     Serial.println(central.address());
 
     // while the central is still connected to peripheral:
+    static unsigned long lastBeat = 0;
     while (central.connected()) {
       BLE.poll();
+
+      // Heartbeat: even with no commands, watch the memory trend over time.
+      // A steady freeRAM with idle but a drop after each command points at the
+      // String churn on the receive path; a steady drift while idle points elsewhere.
+      if (millis() - lastBeat > 5000) {
+        lastBeat = millis();
+        Serial.print("[beat] up=");
+        Serial.print(millis() / 1000);
+        Serial.print("s ");
+        logMemory("idle");
+      }
     }
 
     // when the central disconnects, print it out:
