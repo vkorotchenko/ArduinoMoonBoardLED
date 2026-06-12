@@ -11,6 +11,12 @@
 // reconnect, instead of sitting dead until a manual reset.
 #define WDT_TIMEOUT_MS 16000
 
+// If a connection drops and nothing reconnects within this window, reboot to force a
+// clean BLE bring-up. Catches the case where the NINA stops advertising after a
+// disconnect but the loop keeps running — so the watchdog (which only catches hangs)
+// would never fire.
+#define REBOOT_AFTER_DISCONNECT_MS 60000
+
 // --- Persist the last displayed pattern across reboots ----------------------
 // The watchdog reboot (and any power cycle) clears the LEDs, and the MoonBoard app
 // won't necessarily re-send the current problem. We save the last problem string to
@@ -92,19 +98,17 @@ bool useadditionalled = false; // Variable to store the additional LED setting
 
 
 void ConnectHandler(BLEDevice central) {
-  Serial.print("Connected event, central: ");
-  Serial.println(central.address());
+  if (Serial) { Serial.print("Connected event, central: "); Serial.println(central.address()); }
   // Start every new connection with a clean parser, so a problem string left
   // half-received by a previous disconnect can't corrupt this session's first message.
   state = 0;
   problemstring[0] = '\0';
   useadditionalled = false;
-  BLE.advertise();
+  BLE.advertise(); // keep advertising so additional centrals can connect (multi-user)
 }
 
 void DisconnectHandler(BLEDevice central) {
-  Serial.print("Disconnected event, central: ");
-  Serial.println(central.address());
+  if (Serial) { Serial.print("Disconnected event, central: "); Serial.println(central.address()); }
   BLE.advertise();
 }
 
@@ -394,39 +398,48 @@ void setup() {
 }
 
 void loop() {
-  Watchdog.reset(); // feed the watchdog every iteration (also covers the idle/no-central path)
+  Watchdog.reset(); // fed every iteration; only a blocked BLE.poll() (a true hang) trips it
+  BLE.poll();       // service BLE and deliver incoming writes (characteristicWritten)
 
-  // listen for Bluetooth® Low Energy peripherals to connect:
+  static bool wasConnected = false;
+  static unsigned long lastBeat = 0;
+  static unsigned long disconnectedAt = 0;
+
   BLEDevice central = BLE.central();
+  bool connected = central && central.connected();
 
-  // if a central is connected to peripheral:
-  if (central) {
-
-    Serial.print("Connected to central: ");
-    // print the central's MAC address:
-    Serial.println(central.address());
-
-    // while the central is still connected to peripheral:
-    static unsigned long lastBeat = 0;
-    while (central.connected()) {
-      BLE.poll();
-      Watchdog.reset(); // keep feeding while connected — a healthy idle link is never reset;
-                        // only a blocked BLE.poll() (wedged NINA) stops this and triggers reboot
-
-      // Heartbeat: even with no commands, watch the memory trend over time.
-      // A steady freeRAM with idle but a drop after each command points at the
-      // String churn on the receive path; a steady drift while idle points elsewhere.
-      if (millis() - lastBeat > 5000) {
-        lastBeat = millis();
-        Serial.print("[beat] up=");
-        Serial.print(millis() / 1000);
-        Serial.print("s ");
-        logMemory("idle");
-      }
+  if (connected) {
+    if (!wasConnected) {
+      wasConnected = true;
+      disconnectedAt = 0; // clear the recovery timer
+      if (Serial) { Serial.print("Connected to central: "); Serial.println(central.address()); }
     }
 
-    // when the central disconnects, print it out:
-    Serial.print(F("Disconnected from central: "));
-    Serial.println(central.address());
+    // Heartbeat — only when a monitor is attached, so field operation never blocks on
+    // the USB-CDC serial endpoint. A healthy idle link stays connected indefinitely here.
+    if (Serial && millis() - lastBeat > 5000) {
+      lastBeat = millis();
+      Serial.print("[beat] up=");
+      Serial.print(millis() / 1000);
+      Serial.print("s ");
+      logMemory("idle");
+    }
+  } else {
+    if (wasConnected) {
+      // Just disconnected: re-advertise from the main-loop context (more reliable on the
+      // NINA than doing it only inside the disconnect event handler) and start the timer.
+      wasConnected = false;
+      disconnectedAt = millis();
+      if (Serial) Serial.println("Disconnected from central — re-advertising");
+      BLE.advertise();
+    }
+
+    // If a dropped link doesn't recover, reboot for a clean BLE bring-up. The watchdog
+    // can't catch this — the loop is running fine, the NINA just stopped advertising.
+    if (disconnectedAt != 0 && millis() - disconnectedAt > REBOOT_AFTER_DISCONNECT_MS) {
+      if (Serial) Serial.println("BLE did not recover after disconnect — rebooting");
+      delay(20);
+      NVIC_SystemReset();
+    }
   }
 }
