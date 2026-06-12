@@ -3,12 +3,40 @@
 #include <config.h>
 #include <malloc.h>
 #include <Adafruit_SleepyDog.h>
+#include <FlashStorage.h>
 
 // Hardware watchdog timeout (ms). The SAMD21 caps this at ~16 s. If the loop stops
 // feeding the watchdog for this long — e.g. the NINA BLE co-processor wedges and
 // BLE.poll() blocks — the board resets, reboots, and re-advertises so the app can
 // reconnect, instead of sitting dead until a manual reset.
 #define WDT_TIMEOUT_MS 16000
+
+// --- Persist the last displayed pattern across reboots ----------------------
+// The watchdog reboot (and any power cycle) clears the LEDs, and the MoonBoard app
+// won't necessarily re-send the current problem. We save the last problem string to
+// flash and re-render it on boot so the board restores its pattern on its own.
+typedef struct {
+  bool valid;
+  bool useadditional;
+  char problem[500];
+} StoredProblem;
+FlashStorage(problemStore, StoredProblem);
+
+// RAM cache of what's currently in flash, so we only erase/write flash when the
+// problem actually changes (re-sending the same problem costs no flash wear).
+char lastSavedProblem[500] = "";
+
+void persistProblem(const char *problem, bool additional) {
+  if (strcmp(problem, lastSavedProblem) == 0) return; // unchanged — skip the flash write
+  StoredProblem sp;
+  sp.valid = true;
+  sp.useadditional = additional;
+  strncpy(sp.problem, problem, sizeof(sp.problem) - 1);
+  sp.problem[sizeof(sp.problem) - 1] = '\0';
+  problemStore.write(sp);
+  strcpy(lastSavedProblem, sp.problem);
+  Serial.println("[flash] saved current pattern");
+}
 
 // --- Memory / timeout instrumentation ---------------------------------------
 // The SAMD21 has only 32 KB of SRAM and no heap compaction, so the heavy use of
@@ -232,6 +260,7 @@ void display(byte incoming[], int length){
 
       if (hold == NULL) { // Last hold has been processed!
         strip.Show(); // Light up all hold (and additional) LEDs
+        persistProblem(problemstringstore, useadditionalled); // remember it across reboots
         problemstring[0] = '\0'; // Reset problem string
         useadditionalled = false; // Reset additional LED option
         state = 0; // Switch to state 0 (wait for new problem string or configuration)
@@ -349,6 +378,19 @@ void setup() {
   Serial.print("Watchdog enabled, timeout ");
   Serial.print(wdtActual);
   Serial.println(" ms");
+
+  // Restore the last displayed pattern after a reboot (watchdog reset / power cycle),
+  // so the board re-lights on its own without waiting for the app to resend.
+  StoredProblem sp = problemStore.read();
+  if (sp.valid && sp.problem[0] != '\0') {
+    strcpy(lastSavedProblem, sp.problem); // seed the cache so we don't re-write it
+    strcpy(problemstring, sp.problem);
+    useadditionalled = sp.useadditional;
+    state = 4; // jump straight to the render stage
+    Serial.print("Restoring last pattern: ");
+    Serial.println(problemstring);
+    display(NULL, 0); // no new bytes — just render problemstring and reset state
+  }
 }
 
 void loop() {
