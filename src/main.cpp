@@ -2,6 +2,13 @@
 #include <NeoPixelBus.h>
 #include <config.h>
 #include <malloc.h>
+#include <Adafruit_SleepyDog.h>
+
+// Hardware watchdog timeout (ms). The SAMD21 caps this at ~16 s. If the loop stops
+// feeding the watchdog for this long — e.g. the NINA BLE co-processor wedges and
+// BLE.poll() blocks — the board resets, reboots, and re-advertises so the app can
+// reconnect, instead of sitting dead until a manual reset.
+#define WDT_TIMEOUT_MS 16000
 
 // --- Memory / timeout instrumentation ---------------------------------------
 // The SAMD21 has only 32 KB of SRAM and no heap compaction, so the heavy use of
@@ -59,6 +66,11 @@ bool useadditionalled = false; // Variable to store the additional LED setting
 void ConnectHandler(BLEDevice central) {
   Serial.print("Connected event, central: ");
   Serial.println(central.address());
+  // Start every new connection with a clean parser, so a problem string left
+  // half-received by a previous disconnect can't corrupt this session's first message.
+  state = 0;
+  problemstring[0] = '\0';
+  useadditionalled = false;
   BLE.advertise();
 }
 
@@ -262,6 +274,24 @@ void characteristicWritten(BLEDevice central, BLECharacteristic characteristic) 
 void setup() {
   Serial.begin(9600);
 
+  // Bring BLE up FIRST, before the ~20 s LED animation, so the board becomes
+  // discoverable within ~2 s of a (re)boot instead of waiting for the animation.
+  if (!BLE.begin()) {
+    // BLE bring-up failed. The watchdog isn't enabled yet (it must come after the
+    // animation), so reboot explicitly to retry rather than hanging forever.
+    delay(50);
+    NVIC_SystemReset();
+  }
+  BLE.setLocalName("Moonboard");
+  BLE.setDeviceName("Moonboard");
+  BLE.setAdvertisedService(uartService);
+  uartService.addCharacteristic(receiveCharacteristic);
+  uartService.addCharacteristic(transmitCharacteristic);
+  receiveCharacteristic.setEventHandler(BLEWritten, characteristicWritten);
+  BLE.addService(uartService);
+  BLE.setEventHandler(BLEConnected, ConnectHandler);
+  BLE.setEventHandler(BLEDisconnected, DisconnectHandler);
+  BLE.advertise();
 
   strip.Begin(); // Initialize LED strip
   strip.Show(); // Good practice to call Show() in order to clear all LEDs
@@ -313,24 +343,17 @@ void setup() {
   strip.ClearTo(black);
   strip.Show();
 
-  if (!BLE.begin()) {
-    while (1);
-  }
-  BLE.setLocalName("Moonboard");
-  BLE.setDeviceName("Moonboard");
-
-  BLE.setAdvertisedService(uartService);
-  uartService.addCharacteristic(receiveCharacteristic);
-  uartService.addCharacteristic(transmitCharacteristic);
-  receiveCharacteristic.setEventHandler(BLEWritten, characteristicWritten);
-  BLE.addService(uartService);
-  BLE.setEventHandler(BLEConnected, ConnectHandler);
-  BLE.setEventHandler(BLEDisconnected, DisconnectHandler);
-
-  BLE.advertise();
+  // Enable the watchdog AFTER the (~20 s) boot animation so it can't trip during it.
+  // From here on, any code path that stalls longer than WDT_TIMEOUT_MS reboots the board.
+  int wdtActual = Watchdog.enable(WDT_TIMEOUT_MS);
+  Serial.print("Watchdog enabled, timeout ");
+  Serial.print(wdtActual);
+  Serial.println(" ms");
 }
 
 void loop() {
+  Watchdog.reset(); // feed the watchdog every iteration (also covers the idle/no-central path)
+
   // listen for Bluetooth® Low Energy peripherals to connect:
   BLEDevice central = BLE.central();
 
@@ -345,6 +368,8 @@ void loop() {
     static unsigned long lastBeat = 0;
     while (central.connected()) {
       BLE.poll();
+      Watchdog.reset(); // keep feeding while connected — a healthy idle link is never reset;
+                        // only a blocked BLE.poll() (wedged NINA) stops this and triggers reboot
 
       // Heartbeat: even with no commands, watch the memory trend over time.
       // A steady freeRAM with idle but a drop after each command points at the
