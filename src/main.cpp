@@ -307,6 +307,8 @@ void characteristicWritten(BLEDevice central, BLECharacteristic characteristic) 
 void setup() {
   Serial.begin(9600);
 
+  pinMode(LED_BUILTIN, OUTPUT); // onboard-LED liveness indicator (see loop())
+
   // Bring BLE up FIRST, before the ~20 s LED animation, so the board becomes
   // discoverable within ~2 s of a (re)boot instead of waiting for the animation.
   if (!BLE.begin()) {
@@ -400,6 +402,17 @@ void setup() {
 void loop() {
   Watchdog.reset(); // fed every iteration; only a blocked BLE.poll() (a true hang) trips it
   BLE.poll();       // service BLE and deliver incoming writes (characteristicWritten)
+
+  // Liveness indicator, independent of serial: blink the onboard LED ~1 Hz. If this keeps
+  // blinking on external power with no computer attached, the loop is running (not asleep).
+  // If it freezes, the loop has truly hung — and the watchdog should reboot within ~16 s.
+  static unsigned long lastBlink = 0;
+  static bool ledOn = false;
+  if (millis() - lastBlink > 500) {
+    lastBlink = millis();
+    ledOn = !ledOn;
+    digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
+  }
 
   static bool wasConnected = false;
   static unsigned long lastBeat = 0;
