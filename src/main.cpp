@@ -1,16 +1,3 @@
-// MoonBoard LED controller — Adafruit Feather ESP32 V2 build.
-//
-// This is the ESP32 port of main.cpp. The problem-string parsing state machine and
-// all colour/LED logic are identical to the Nano build; only the two platform-specific
-// pieces differ:
-//   1. BLE transport: the built-in ESP32 BLEDevice library exposes the same Nordic UART
-//      Service (NUS) UUIDs the MoonBoard app expects, so the app cannot tell the difference.
-//   2. LED output: NeoPixelBus drives the WS2811 string via the ESP32 RMT peripheral.
-//
-// The key reliability win over the Nano 33 IoT is that advertising is restarted from the
-// disconnect callback on an on-die radio, so the board becomes discoverable again the moment
-// the phone drops an idle link.
-
 #include <NeoPixelBus.h>
 #include <config.h>
 
@@ -22,16 +9,8 @@
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 
-// Seconds the main loop may stall before the task watchdog resets the board.
-// A reset caused this way is logged as ESP_RST_TASK_WDT on the next boot, turning
-// a silent freeze into a recorded reboot with a backtrace.
 #define LOOP_WDT_TIMEOUT_S 15
 
-// --- Crash breadcrumbs -------------------------------------------------------
-// RTC_NOINIT memory keeps its value across resets (panic, watchdog, soft reset) as long
-// as power is maintained — it is NOT cleared on reboot like normal RAM. We use it to carry
-// "what was the board doing right before it died" across the crash so it can be logged on
-// the next boot. (It is lost on a full power cycle / brownout, which is expected.)
 RTC_NOINIT_ATTR static uint32_t crashMagic;
 RTC_NOINIT_ATTR static int      lastState;
 RTC_NOINIT_ATTR static char     lastProblem[256];
@@ -53,7 +32,6 @@ static const char *resetReasonName(esp_reset_reason_t r) {
   }
 }
 
-// Record what the board is about to do, so a crash here leaves a trail.
 static void breadcrumb(int stateNow, const char *problem) {
   lastState = stateNow;
   if (problem != nullptr) {
@@ -63,11 +41,9 @@ static void breadcrumb(int stateNow, const char *problem) {
   crashMagic = CRASH_MAGIC;
 }
 
-// Nordic UART Service — must match what the MoonBoard app scans for (same UUIDs the
-// HardwareBLESerial library advertised on the Nano build).
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-#define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" // phone -> board (write)
-#define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" // board -> phone (notify)
+#define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 #ifdef GRB
 NeoPixelBus<NeoGrbFeature, NeoEsp32Rmt0Ws2811Method> strip(PixelCount, PixelPin);
@@ -84,15 +60,45 @@ RgbColor pink(brightness, 0, brightness/2);
 RgbColor violet(brightness/2, 0, brightness);
 RgbColor black(0);
 
+// Onboard status NeoPixel (Feather ESP32 V2): green = powered on, blue = BLE connected.
+#ifndef PIN_NEOPIXEL
+#define PIN_NEOPIXEL 0
+#endif
+#ifndef NEOPIXEL_I2C_POWER
+#define NEOPIXEL_I2C_POWER 2
+#endif
+const uint8_t statusbrightness = 24;
+NeoPixelBus<NeoGrbFeature, NeoEsp32Rmt1Ws2812xMethod> statusPixel(1, (uint8_t)PIN_NEOPIXEL);
+RgbColor statusGreen(0, statusbrightness, 0);
+RgbColor statusBlue(0, 0, statusbrightness);
+
+static void setStatusColor(RgbColor color) {
+  statusPixel.SetPixelColor(0, color);
+  statusPixel.Show();
+}
+
+// Boot self-test: cycle each color as a single pixel travelling up the strip,
+// then clear. Feeds the task watchdog so the long animation can't trip it.
+static void startupAnimation() {
+  RgbColor colors[] = {green, blue, yellow, cyan, pink, violet, red};
+  for (RgbColor color : colors) {
+    strip.SetPixelColor(0, color);
+    for (int i = 0; i < PixelCount; i++) {
+      strip.ShiftRight(1);
+      strip.Show();
+      esp_task_wdt_reset();
+      delay(10);
+    }
+  }
+  strip.ClearTo(black);
+  strip.Show();
+}
+
 int state = 0; // Variable to store the current state of the problem string parser
 char problemstring[500]=""; // Variable to store the current problem string
 char problemstringstore[500]=""; // Variable to store the current problem string
 bool useadditionalled = false; // Variable to store the additional LED setting
 
-// --- BLE receive buffer ------------------------------------------------------
-// The BLE onWrite callback runs in a separate FreeRTOS task from loop(), so the ring
-// buffer is guarded by a critical-section spinlock. This mirrors the available()/read()
-// interface the original sketch relied on.
 static const size_t RX_BUF_SIZE = 1024;
 static volatile uint8_t rxBuf[RX_BUF_SIZE];
 static volatile size_t rxHead = 0;
@@ -103,7 +109,7 @@ static void rxPush(const uint8_t *data, size_t len) {
   portENTER_CRITICAL(&rxMux);
   for (size_t i = 0; i < len; i++) {
     size_t next = (rxHead + 1) % RX_BUF_SIZE;
-    if (next == rxTail) break; // buffer full, drop the rest
+    if (next == rxTail) break;
     rxBuf[rxHead] = data[i];
     rxHead = next;
   }
@@ -128,15 +134,14 @@ static int rxRead() {
   return c;
 }
 
-// --- BLE callbacks -----------------------------------------------------------
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
     Serial.println("BLE central connected");
+    setStatusColor(statusBlue);
   }
   void onDisconnect(BLEServer *server) override {
-    // Critical fix for the "not discoverable after idle disconnect" symptom:
-    // the ESP32 core does NOT auto-resume advertising, so restart it here.
     Serial.println("BLE central disconnected — restarting advertising");
+    setStatusColor(statusGreen);
     server->getAdvertising()->start();
   }
 };
@@ -153,9 +158,8 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 
 void setup() {
   Serial.begin(115200);
-  delay(200); // give the USB-serial link a moment so the boot report is not missed
+  delay(200);
 
-  // --- Why did we (re)boot? -------------------------------------------------
   esp_reset_reason_t reason = esp_reset_reason();
   Serial.println("\n==================== BOOT ====================");
   Serial.printf("Reset reason: %s\n", resetReasonName(reason));
@@ -170,32 +174,33 @@ void setup() {
   } else if (reason == ESP_RST_POWERON) {
     Serial.println("(clean power-on — no prior crash context)");
   }
-  crashMagic = 0; // clear until the next breadcrumb, so stale data is not re-reported
+  crashMagic = 0;
   Serial.println("=============================================");
 
-  // Task watchdog: if loop() stalls for LOOP_WDT_TIMEOUT_S, force a (logged) reset.
   esp_task_wdt_init(LOOP_WDT_TIMEOUT_S, true);
-  esp_task_wdt_add(NULL); // watch the Arduino loop task
+  esp_task_wdt_add(NULL);
 
   strip.Begin(); // Initialize LED strip
   strip.Show();  // Good practice to call Show() in order to clear all LEDs
   strip.ClearTo(black);
   strip.Show();
 
-  // Bring up BLE with the Nordic UART Service the MoonBoard app expects.
+  pinMode(NEOPIXEL_I2C_POWER, OUTPUT);
+  digitalWrite(NEOPIXEL_I2C_POWER, HIGH); // power the onboard NeoPixel rail
+  delay(10);
+  statusPixel.Begin();
+  setStatusColor(statusGreen); // green = powered on, not yet connected
+
   BLEDevice::init("Moonboard");
   BLEServer *server = BLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());
 
   BLEService *service = server->createService(NUS_SERVICE_UUID);
 
-  // TX (notify) — present so the service matches a standard NUS; the sketch logs over
-  // USB Serial rather than over BLE, so nothing is pushed here.
   BLECharacteristic *txCharacteristic =
       service->createCharacteristic(NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
   txCharacteristic->addDescriptor(new BLE2902());
 
-  // RX (write / write-without-response) — the app pushes problem strings here.
   BLECharacteristic *rxCharacteristic = service->createCharacteristic(
       NUS_RX_UUID,
       BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
@@ -209,10 +214,12 @@ void setup() {
   BLEDevice::startAdvertising();
 
   Serial.println("BLE advertising as \"Moonboard\"");
+
+  startupAnimation(); // LED self-test; BLE is already advertising so the board stays discoverable
 }
 
 void loop() {
-  esp_task_wdt_reset(); // tell the watchdog the loop is still alive
+  esp_task_wdt_reset();
 
   // Check if message parts are available from the BLE UART
   while (rxAvailable() > 0) {
@@ -258,7 +265,6 @@ void loop() {
         continue;
       }
 
-      // Append the character to the problem string (bounded, null-terminated).
       size_t len = strlen(problemstring);
       if (len < sizeof(problemstring) - 1) {
         problemstring[len] = c;
@@ -269,7 +275,7 @@ void loop() {
 
   // State 4: complete problem string received, start parsing
   if (state == 4) {
-    breadcrumb(state, problemstring); // record context in case parsing crashes
+    breadcrumb(state, problemstring);
     strip.ClearTo(black); // Turn off all LEDs in LED string
     Serial.println("\n---------");
     Serial.print("Problem string: ");
@@ -288,7 +294,7 @@ void loop() {
 
         char holdtype = hold[0]; // Hold descriptions consist of a hold type (S, P, E) ...
         int holdnumber = atoi(&hold[1]); // ... and a hold number
-        if (holdnumber < 0 || holdnumber >= (int)PixelCount) { // guard against bad input
+        if (holdnumber < 0 || holdnumber >= (int)PixelCount) {
           Serial.printf("  ! ignoring out-of-range hold %c%d\n", holdtype, holdnumber);
         } else {
         int lednumber = ledmapping[holdnumber];
@@ -309,9 +315,9 @@ void loop() {
           }
           // Finish holds don't get an additional LED!
         }
-        } // end bounds-valid
+        }
 
-        hold = strtok(NULL, " - ");// get next hold
+        hold = strtok(NULL, ", ");// get next hold
       }
 
       strcpy(problemstring, problemstringstore); // Restore problem string for rendering normal hold LEDs
@@ -325,7 +331,7 @@ void loop() {
 
       char holdtype = hold[0]; // Hold descriptions consist of a hold type (S, P, E) ...
       int holdnumber = atoi(&hold[1]); // ... and a hold number
-      if (holdnumber < 0 || holdnumber >= (int)PixelCount) { // guard against bad input
+      if (holdnumber < 0 || holdnumber >= (int)PixelCount) {
         Serial.printf("  ! ignoring out-of-range hold %c%d\n", holdtype, holdnumber);
       } else {
       int lednumber = ledmapping[holdnumber];
@@ -357,9 +363,9 @@ void loop() {
         strip.SetPixelColor(lednumber, red);
         Serial.println(" (red)");
       }
-      } // end bounds-valid
+      }
 
-      hold = strtok(NULL, " - "); // get next hold
+      hold = strtok(NULL, ", "); // get next hold
 
       if (hold == NULL) { // Last hold has been processed!
         strip.Show(); // Light up all hold (and additional) LEDs
