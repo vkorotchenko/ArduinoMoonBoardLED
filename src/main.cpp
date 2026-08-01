@@ -134,15 +134,55 @@ static int rxRead() {
   return c;
 }
 
+// Diagnostics for comparing app versions: total writes since connect and the
+// chunk index within the current message (a message ends with '#'). If an app
+// fragments a problem across several BLE writes, chunk climbs above 1.
+static uint32_t rxWriteSeq = 0; // total RX writes since the last connect
+static uint16_t rxChunk = 1;    // write index within the current message
+
+// Dump one raw BLE write exactly as received (before any parsing), as both hex
+// and printable ASCII. Useful for diffing what different app versions send.
+static void logRawWrite(const uint8_t *data, size_t len) {
+  Serial.printf("[BT RX] write #%lu, chunk %u, %u bytes\n",
+                (unsigned long)++rxWriteSeq, (unsigned)rxChunk, (unsigned)len);
+  Serial.print("  hex:   ");
+  for (size_t i = 0; i < len; i++) {
+    Serial.printf("%02X ", data[i]);
+  }
+  Serial.print("\n  ascii: ");
+  for (size_t i = 0; i < len; i++) {
+    char c = (char)data[i];
+    Serial.print((c >= 0x20 && c < 0x7F) ? c : '.');
+  }
+  Serial.println();
+
+  // A problem message terminates with '#'. Reset the chunk counter when this
+  // write closes one; otherwise the next write is a continuation of the same
+  // message. (len > 2 avoids treating the bare "l#" opener as a terminator.)
+  if (len > 2 && data[len - 1] == '#') {
+    rxChunk = 1;
+  } else {
+    rxChunk++;
+  }
+}
+
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
     Serial.println("BLE central connected");
+    rxWriteSeq = 0; // restart write/chunk counters for the new session
+    rxChunk = 1;
     setStatusColor(statusBlue);
   }
   void onDisconnect(BLEServer *server) override {
     Serial.println("BLE central disconnected — restarting advertising");
     setStatusColor(statusGreen);
     server->getAdvertising()->start();
+  }
+  void onMtuChanged(BLEServer *server, esp_ble_gatts_cb_param_t *param) override {
+    // Negotiated ATT MTU. Payload per write is MTU-3 bytes; a small MTU forces
+    // an app to fragment long problems, which is a likely version difference.
+    Serial.printf("[BT] MTU negotiated: %u (max write payload %u bytes)\n",
+                  (unsigned)param->mtu.mtu, (unsigned)(param->mtu.mtu - 3));
   }
 };
 
@@ -151,6 +191,7 @@ class RxCallbacks : public BLECharacteristicCallbacks {
     uint8_t *data = characteristic->getData();
     size_t len = characteristic->getLength();
     if (data != nullptr && len > 0) {
+      logRawWrite(data, len);
       rxPush(data, len);
     }
   }
